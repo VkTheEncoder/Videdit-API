@@ -3,24 +3,21 @@ import time
 import asyncio
 import aiohttp
 import aiofiles
-from pyrogram import Client, filters, enums
+from pyrogram import Client, filters
 from dotenv import load_dotenv
 from processor import process_video_task
 from utils import progress_bar
 
-# Load Env
 load_dotenv()
 
-# Setup Client
 app = Client(
     "video_editor_bot",
     api_id=int(os.getenv("API_ID")),
     api_hash=os.getenv("API_HASH"),
     bot_token=os.getenv("BOT_TOKEN"),
-    workers=4  # Allow handling multiple users at once
+    workers=4
 )
 
-# Directories
 DOWNLOAD_DIR = "downloads"
 OUTPUT_DIR = "outputs"
 TEMP_AUDIO = "temp_audio"
@@ -28,208 +25,214 @@ TEMP_AUDIO = "temp_audio"
 for d in [DOWNLOAD_DIR, OUTPUT_DIR, TEMP_AUDIO]:
     os.makedirs(d, exist_ok=True)
 
-# User State Storage (In-Memory)
-# Structure: { user_id: { "state": "WAIT_JSON", "data": {...} } }
-user_sessions = {}
+# --- GLOBAL QUEUE SYSTEM ---
+task_queue = asyncio.Queue()
+is_processing = False
+current_task_info = {} # Stores info about current running task for cancellation
 
-# States
+user_sessions = {}
 STATE_WAIT_JSON = 1
 STATE_WAIT_VIDEO = 2
 STATE_WAIT_NAME = 3
-STATE_PROCESSING = 4
+STATE_QUEUED = 4
 
-# --- Helper Functions ---
+# --- WORKER LOOP ---
+async def queue_worker():
+    global is_processing, current_task_info
+    print("👷 Worker started...")
+    
+    while True:
+        # Wait for a task
+        task_data = await task_queue.get()
+        is_processing = True
+        
+        user_id = task_data['user_id']
+        chat_id = task_data['chat_id']
+        status_msg = task_data['status_msg']
+        
+        # Setup Stop Signal
+        shared_state = {'stop_signal': False, 'text': '', 'percent': 0, 'current': 0, 'total': 0}
+        current_task_info = {'user_id': user_id, 'shared_state': shared_state, 'status_msg': status_msg}
 
-async def download_from_link(url, dest_path, status_msg):
-    """Downloads file from direct URL."""
+        try:
+            await status_msg.edit(f"🎬 **Starting Task!**\nQueue Position: 0 (Running)")
+            
+            # 1. Download Video
+            input_video_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_input.mp4")
+            if task_data["video_source"] == "link":
+                await status_msg.edit("⬇️ **Downloading Video from Link...**")
+                if not await download_from_link(task_data["video_link"], input_video_path, status_msg, shared_state):
+                     raise Exception("Download failed.")
+            elif task_data["video_source"] == "telegram":
+                await status_msg.edit("⬇️ **Downloading Video from Telegram...**")
+                await task_data["video_message"].download(
+                    file_name=input_video_path,
+                    progress=progress_bar,
+                    progress_args=("⬇️ **Downloading...**", time.time(), status_msg)
+                )
+
+            if shared_state['stop_signal']: raise Exception("⛔ Task Stopped")
+
+            # 2. Process Video
+            output_video_path = os.path.join(OUTPUT_DIR, f"{task_data['filename']}.mp4")
+            
+            async def update_status_text(txt):
+                if not shared_state['stop_signal']:
+                    try: await status_msg.edit(f"⚙️ **Processing...**\n\n{txt}")
+                    except: pass
+
+            await process_video_task(
+                input_video_path, 
+                task_data['json_path'], 
+                output_video_path, 
+                update_status_text,
+                shared_state
+            )
+
+            # 3. Upload
+            await status_msg.edit("⬆️ **Uploading Final Video...**")
+            await app.send_video(
+                chat_id=chat_id,
+                video=output_video_path,
+                caption=f"✅ **{task_data['filename']}** is ready!",
+                progress=progress_bar,
+                progress_args=("⬆️ **Uploading...**", time.time(), status_msg)
+            )
+            await status_msg.delete()
+            
+            # Cleanup
+            await clean_up([task_data['json_path'], input_video_path, output_video_path])
+
+        except Exception as e:
+            if "Stopped" in str(e):
+                await status_msg.edit("🛑 **Process Stopped by Admin.**")
+            else:
+                await status_msg.edit(f"❌ **Error:** {str(e)}")
+                print(f"Task Error: {e}")
+            
+            # Cleanup on error
+            try:
+                paths = [task_data['json_path'], os.path.join(DOWNLOAD_DIR, f"{user_id}_input.mp4")]
+                await clean_up(paths)
+            except: pass
+            
+        finally:
+            is_processing = False
+            current_task_info = {}
+            task_queue.task_done()
+            user_sessions.pop(user_id, None)
+
+async def download_from_link(url, dest_path, status_msg, shared_state):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as response:
-                if response.status != 200:
-                    return False
-                
-                total_size = int(response.headers.get('content-length', 0))
+                if response.status != 200: return False
+                total = int(response.headers.get('content-length', 0))
                 downloaded = 0
-                start_time = time.time()
-                
+                start = time.time()
                 async with aiofiles.open(dest_path, mode='wb') as f:
-                    async for chunk in response.content.iter_chunked(1024 * 1024): # 1MB chunks
+                    async for chunk in response.content.iter_chunked(1024 * 1024):
+                        if shared_state['stop_signal']: return False
                         await f.write(chunk)
                         downloaded += len(chunk)
-                        if total_size > 0:
-                            await progress_bar(downloaded, total_size, "⬇️ **Downloading from Link...**", start_time, status_msg)
+                        if total > 0: await progress_bar(downloaded, total, "⬇️ **Downloading...**", start, status_msg)
         return True
-    except Exception as e:
-        print(f"Link Download Error: {e}")
-        return False
+    except: return False
 
-async def clean_up(file_paths):
-    """Deletes temporary files."""
-    for path in file_paths:
-        if path and os.path.exists(path):
-            try:
-                os.remove(path)
-            except Exception as e:
-                print(f"Error deleting {path}: {e}")
+async def clean_up(paths):
+    for p in paths:
+        if p and os.path.exists(p):
+            try: os.remove(p)
+            except: pass
 
-# --- Bot Handlers ---
+# --- COMMANDS ---
+
+@app.on_message(filters.command("stopall"))
+async def stop_all(client, message):
+    global is_processing, current_task_info
+    
+    # 1. Clear Queue
+    q_size = task_queue.qsize()
+    while not task_queue.empty():
+        try: task_queue.get_nowait()
+        except: break
+    
+    msg = f"🛑 **Stopping Everything...**\nDeleted {q_size} queued tasks."
+    
+    # 2. Stop Current Task
+    if is_processing and current_task_info:
+        current_task_info['shared_state']['stop_signal'] = True
+        msg += "\nSent STOP signal to current process."
+    else:
+        msg += "\nNo active process found."
+        
+    await message.reply_text(msg)
 
 @app.on_message(filters.command("start"))
 async def start(client, message):
-    user_id = message.from_user.id
-    user_sessions[user_id] = {"state": STATE_WAIT_JSON, "data": {}}
-    
-    await message.reply_text(
-        "👋 **Welcome! Let's create your video.**\n\n"
-        "**Step 1:** Please upload the `map.json` file."
-    )
+    user_sessions[message.from_user.id] = {"state": STATE_WAIT_JSON, "data": {}}
+    await message.reply_text("👋 **Welcome!**\nStep 1: Send `map.json` file.")
 
 @app.on_message(filters.document)
-async def handle_document(client, message):
-    user_id = message.from_user.id
-    session = user_sessions.get(user_id)
+async def handle_doc(client, message):
+    uid = message.from_user.id
+    sess = user_sessions.get(uid)
+    if not sess: return
 
-    if not session:
-        return # Ignore if user hasn't started
-
-    # --- Step 1: Handle JSON ---
-    if session["state"] == STATE_WAIT_JSON:
+    if sess["state"] == STATE_WAIT_JSON:
         if not message.document.file_name.endswith(".json"):
-            await message.reply_text("❌ That doesn't look like a JSON file. Please try again.")
+            await message.reply_text("❌ Send a valid .json file.")
             return
+        
+        status = await message.reply_text("📥 Saving Map...")
+        path = os.path.join(DOWNLOAD_DIR, f"{uid}_map.json")
+        await message.download(file_name=path)
+        
+        sess["data"]["json_path"] = path
+        sess["state"] = STATE_WAIT_VIDEO
+        await status.edit("✅ **Map Saved!**\nStep 2: Send Video or Link.")
 
-        status_msg = await message.reply_text("📥 **Saving Map...**")
-        
-        # Save JSON with unique ID
-        json_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_map.json")
-        await message.download(file_name=json_path)
-        
-        # Update Session
-        session["data"]["json_path"] = json_path
-        session["state"] = STATE_WAIT_VIDEO
-        
-        await status_msg.edit(
-            "✅ **Map Saved!**\n\n"
-            "**Step 2:** Now, send the **Video File** OR a **Direct Download Link**."
-        )
+@app.on_message(filters.video | filters.text)
+async def handle_input(client, message):
+    uid = message.from_user.id
+    sess = user_sessions.get(uid)
+    if not sess: return
 
-    # --- Step 2 (Option A): Handle Video File Upload ---
-    elif session["state"] == STATE_WAIT_VIDEO:
-        # If user sends a document that is actually a video
-        if message.document.mime_type.startswith("video"):
-            session["data"]["video_source"] = "telegram"
-            session["data"]["video_message"] = message # Store message to download later
-            
-            session["state"] = STATE_WAIT_NAME
-            await message.reply_text(
-                "✅ **Video received!**\n\n"
-                "**Step 3:** Finally, send me the **Name** for the output file (e.g., `MyBigVideo`)."
-            )
+    # HANDLE VIDEO/LINK
+    if sess["state"] == STATE_WAIT_VIDEO:
+        if message.video:
+            sess["data"]["video_source"] = "telegram"
+            sess["data"]["video_message"] = message
+            sess["state"] = STATE_WAIT_NAME
+            await message.reply_text("✅ Video Received!\nStep 3: Send Output Name.")
+        elif message.text and message.text.startswith("http"):
+            sess["data"]["video_source"] = "link"
+            sess["data"]["video_link"] = message.text
+            sess["state"] = STATE_WAIT_NAME
+            await message.reply_text("✅ Link Received!\nStep 3: Send Output Name.")
         else:
-            await message.reply_text("❌ Please send a valid Video file or Link.")
+            await message.reply_text("❌ Invalid. Send Video or Link.")
 
-@app.on_message(filters.video)
-async def handle_video(client, message):
-    user_id = message.from_user.id
-    session = user_sessions.get(user_id)
-
-    # --- Step 2 (Option B): Handle Video Media Upload ---
-    if session and session["state"] == STATE_WAIT_VIDEO:
-        session["data"]["video_source"] = "telegram"
-        session["data"]["video_message"] = message
+    # HANDLE NAME -> QUEUE
+    elif sess["state"] == STATE_WAIT_NAME:
+        name = message.text.strip().replace(" ", "_")
+        sess["data"]["filename"] = name
+        sess["data"]["user_id"] = uid
+        sess["data"]["chat_id"] = message.chat.id
         
-        session["state"] = STATE_WAIT_NAME
-        await message.reply_text(
-            "✅ **Video received!**\n\n"
-            "**Step 3:** Finally, send me the **Name** for the output file (e.g., `MyBigVideo`)."
-        )
-
-@app.on_message(filters.text)
-async def handle_text(client, message):
-    user_id = message.from_user.id
-    session = user_sessions.get(user_id)
-    text = message.text.strip()
-
-    if not session:
-        return
-
-    # --- Step 2 (Option C): Handle Link ---
-    if session["state"] == STATE_WAIT_VIDEO:
-        if text.startswith("http"):
-            session["data"]["video_source"] = "link"
-            session["data"]["video_link"] = text
-            
-            session["state"] = STATE_WAIT_NAME
-            await message.reply_text(
-                "✅ **Link received!**\n\n"
-                "**Step 3:** Finally, send me the **Name** for the output file (e.g., `MyBigVideo`)."
-            )
-        else:
-            await message.reply_text("❌ Invalid link. It must start with `http`.")
-
-    # --- Step 3: Handle Name & START PROCESS ---
-    elif session["state"] == STATE_WAIT_NAME:
-        filename = text.replace(" ", "_").replace("/", "") # Sanitize
-        session["state"] = STATE_PROCESSING # Lock state
+        status_msg = await message.reply_text("⏳ **Adding to Queue...**")
+        sess["data"]["status_msg"] = status_msg
         
-        # Setup Paths
-        json_path = session["data"]["json_path"]
-        input_video_path = os.path.join(DOWNLOAD_DIR, f"{user_id}_input.mp4")
-        output_video_path = os.path.join(OUTPUT_DIR, f"{filename}.mp4")
+        # Add to Queue
+        await task_queue.put(sess["data"])
         
-        status_msg = await message.reply_text("🚀 **Initializing Process...**")
+        q_pos = task_queue.qsize()
+        await status_msg.edit(f"✅ **Added to Queue!**\nPosition: #{q_pos}\nWaiting for worker...")
         
-        try:
-            # 1. Download Video
-            if session["data"]["video_source"] == "link":
-                await status_msg.edit("⬇️ **Downloading Video from Link...**")
-                success = await download_from_link(session["data"]["video_link"], input_video_path, status_msg)
-                if not success:
-                    raise Exception("Failed to download from link.")
-            
-            elif session["data"]["video_source"] == "telegram":
-                await status_msg.edit("⬇️ **Downloading Video from Telegram...**")
-                start_time = time.time()
-                # Pyrogram's download with progress
-                await session["data"]["video_message"].download(
-                    file_name=input_video_path,
-                    progress=progress_bar,
-                    progress_args=("⬇️ **Downloading...**", start_time, status_msg)
-                )
-
-            # 2. Process Video
-            async def update_status_text(txt):
-                try:
-                    await status_msg.edit(f"⚙️ **Processing...**\n\n{txt}")
-                except: pass
-
-            await update_status_text("Starting Engine...")
-            await process_video_task(input_video_path, json_path, output_video_path, update_status_text)
-
-            # 3. Upload Result
-            await status_msg.edit("⬆️ **Uploading Final Video...**")
-            start_time = time.time()
-            
-            await client.send_video(
-                chat_id=message.chat.id,
-                video=output_video_path,
-                caption=f"✅ **{filename}** is ready!",
-                progress=progress_bar,
-                progress_args=("⬆️ **Uploading...**", start_time, status_msg)
-            )
-
-            await status_msg.delete()
-            await message.reply_text("✨ **Job Done!** /start to do another.")
-
-        except Exception as e:
-            await status_msg.edit(f"❌ **Error:** {str(e)}")
-            print(f"Error: {e}")
-        
-        finally:
-            # 4. Cleanup
-            await clean_up([json_path, input_video_path, output_video_path])
-            user_sessions.pop(user_id, None)
+        sess["state"] = STATE_QUEUED
 
 if __name__ == "__main__":
     print("🤖 Bot Started...")
+    loop = asyncio.get_event_loop()
+    loop.create_task(queue_worker()) # Start Worker
     app.run()
