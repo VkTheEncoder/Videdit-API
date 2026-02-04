@@ -45,10 +45,17 @@ def load_and_heal_json(file_path):
     with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
     try: return json.loads(content)
     except:
+        # Step 1: Remove invalid control characters
         content = re.sub(r'[\x00-\x1f\x7f]', ' ', content)
-        content = re.sub(r'("explanation_text"\s*:\s*")(.*?)("\s*[,}])', 
-                         lambda m: f'{m.group(1)}{m.group(2).replace("\"", "\\\"")}{m.group(3)}', 
-                         content, flags=re.DOTALL)
+        
+        # Step 2: Fix unescaped quotes (Using + instead of f-string to avoid SyntaxError)
+        content = re.sub(
+            r'("explanation_text"\s*:\s*")(.*?)("\s*[,}])', 
+            lambda m: m.group(1) + m.group(2).replace('"', '\\"') + m.group(3), 
+            content, 
+            flags=re.DOTALL
+        )
+        
         try: return json.loads(content)
         except: raise ValueError("❌ Critical JSON Error: Could not auto-fix file.")
 
@@ -172,7 +179,6 @@ async def process_video_task(video_path, map_path, output_path, status_callback)
             f.write(f"file '{path}'\n")
 
     # Run FFmpeg Command (Copy Stream = Zero Re-encoding)
-    # This takes 2 seconds even for large videos
     command = [
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", 
         "-i", list_file_path, 
