@@ -7,14 +7,14 @@ import re
 import gc
 import subprocess
 import time
-from proglog import ProgressBarLogger  # Required for MoviePy hooks
+from proglog import ProgressBarLogger
 from moviepy import VideoFileClip, AudioFileClip, concatenate_videoclips, vfx
 from dotenv import load_dotenv
 
 load_dotenv()
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 
-# --- CUSTOM LOGGER FOR TELEGRAM ---
+# --- CUSTOM LOGGER ---
 class TelegramLogger(ProgressBarLogger):
     def __init__(self, shared_state, batch_index, total_batches):
         super().__init__()
@@ -22,21 +22,20 @@ class TelegramLogger(ProgressBarLogger):
         self.batch_info = f"Batch {batch_index}/{total_batches}"
 
     def callback(self, **changes):
-        # Every time a bar updates, this is called
+        # CHECK FOR STOP SIGNAL
+        if self.shared_state.get('stop_signal', False):
+            raise Exception("⛔ Task Stopped by User")
+
         for (parameter, value) in changes.items():
-            if parameter == 'bars':
-                # 't' is the main progress bar for rendering
-                if 't' in value:
-                    total = value['t']['total']
-                    index = value['t']['index']
-                    
-                    if total > 0:
-                        percent = int((index / total) * 100)
-                        # Update the shared dictionary
-                        self.shared_state['text'] = f"🎞️ **Rendering {self.batch_info}...**"
-                        self.shared_state['percent'] = percent
-                        self.shared_state['current'] = index
-                        self.shared_state['total'] = total
+            if parameter == 'bars' and 't' in value:
+                total = value['t']['total']
+                index = value['t']['index']
+                if total > 0:
+                    percent = int((index / total) * 100)
+                    self.shared_state['text'] = f"🎞️ **Rendering {self.batch_info}...**"
+                    self.shared_state['percent'] = percent
+                    self.shared_state['current'] = index
+                    self.shared_state['total'] = total
 
 # --- UTILS ---
 def make_progress_bar(current, total):
@@ -84,14 +83,18 @@ def load_and_heal_json(file_path):
 
 # --- BATCH RENDERER ---
 def render_batch(video_path, segments, batch_index, total_batches, temp_dir, shared_state):
-    """
-    Renders a batch and updates shared_state for the UI.
-    """
+    # Check stop signal at start
+    if shared_state.get('stop_signal', False): return None
+
     processed_clips = []
     original_video = VideoFileClip(video_path)
     
     try:
         for i, seg in enumerate(segments):
+            # Check stop signal in loop
+            if shared_state.get('stop_signal', False): 
+                raise Exception("⛔ Task Stopped")
+
             audio_path = f"{temp_dir}/audio_{seg.get('id', f'b{batch_index}_{i}')}.wav"
             if not os.path.exists(audio_path): continue
             
@@ -129,8 +132,6 @@ def render_batch(video_path, segments, batch_index, total_batches, temp_dir, sha
             return None
 
         batch_output = os.path.abspath(f"{temp_dir}/batch_{batch_index}.mp4")
-        
-        # Attach our custom logger here
         tg_logger = TelegramLogger(shared_state, batch_index, total_batches)
 
         final_video = concatenate_videoclips(processed_clips, method="compose")
@@ -141,7 +142,7 @@ def render_batch(video_path, segments, batch_index, total_batches, temp_dir, sha
             fps=24, 
             preset='ultrafast', 
             threads=4, 
-            logger=tg_logger  # <--- THIS IS THE MAGIC
+            logger=tg_logger
         )
         
         final_video.close()
@@ -152,12 +153,14 @@ def render_batch(video_path, segments, batch_index, total_batches, temp_dir, sha
         return batch_output
 
     except Exception as e:
-        print(f"Batch Render Error: {e}")
+        print(f"Batch Render Stopped: {e}")
         original_video.close()
+        if processed_clips:
+            for c in processed_clips: c.close()
         return None
 
 # --- MAIN TASK ---
-async def process_video_task(video_path, map_path, output_path, status_callback):
+async def process_video_task(video_path, map_path, output_path, status_callback, shared_state):
     await status_callback("📂 **Loading Resources...**")
     
     segments = load_and_heal_json(map_path)
@@ -169,45 +172,44 @@ async def process_video_task(video_path, map_path, output_path, status_callback)
     
     # 1. AUDIO GENERATION
     for i, seg in enumerate(segments):
+        if shared_state.get('stop_signal', False): raise Exception("⛔ Task Stopped")
+        
         if i % 5 == 0:
             await status_callback(f"🎙️ **Generating Audio...**\n{make_progress_bar(i, total)}")
         audio_path = f"{temp_dir}/audio_{seg.get('id', i)}.wav"
         if not os.path.exists(audio_path):
             await asyncio.to_thread(generate_audio_sync, seg.get('explanation_text', ''), audio_path)
 
-    # 2. BATCH VIDEO RENDERING
+    # 2. BATCH RENDERING
     BATCH_SIZE = 10
     total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
     batch_files = []
 
-    # Shared State for Progress Bar
-    shared_state = {'text': 'Starting Render...', 'percent': 0, 'current': 0, 'total': 0}
     render_running = True
 
-    # Background Monitor Function
     async def progress_monitor():
         last_text = ""
         while render_running:
-            await asyncio.sleep(4) # Update every 4 seconds
+            if shared_state.get('stop_signal', False): break 
+            
+            await asyncio.sleep(4)
             if shared_state['total'] > 0:
                 percent = shared_state['percent']
                 bar = make_progress_bar(shared_state['current'], shared_state['total'])
                 new_text = f"{shared_state['text']}\n{bar}"
-                
-                # Only edit if text changed substantially
                 if new_text != last_text:
                     await status_callback(new_text)
                     last_text = new_text
 
-    # Start the monitor
     monitor_task = asyncio.create_task(progress_monitor())
 
     try:
         for i in range(0, total, BATCH_SIZE):
+            if shared_state.get('stop_signal', False): raise Exception("⛔ Task Stopped")
+            
             batch_segments = segments[i : i + BATCH_SIZE]
             batch_idx = i // BATCH_SIZE + 1
             
-            # Run rendering (updates shared_state internally)
             batch_file = await asyncio.to_thread(
                 render_batch, 
                 video_path, 
@@ -219,13 +221,15 @@ async def process_video_task(video_path, map_path, output_path, status_callback)
             )
             
             if batch_file: batch_files.append(batch_file)
+            else:
+                if shared_state.get('stop_signal', False): raise Exception("⛔ Task Stopped")
     finally:
         render_running = False
-        monitor_task.cancel() # Stop the monitor
+        monitor_task.cancel()
 
     if not batch_files: raise Exception("No video segments generated.")
 
-    # 3. INSTANT MERGE
+    # 3. MERGE
     await status_callback("🚀 **Final Stitching...**")
     list_file_path = f"{temp_dir}/inputs.txt"
     with open(list_file_path, "w") as f:
