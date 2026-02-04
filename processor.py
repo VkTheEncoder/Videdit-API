@@ -6,14 +6,42 @@ import asyncio
 import re
 import gc
 import subprocess
+import time
+from proglog import ProgressBarLogger  # Required for MoviePy hooks
 from moviepy import VideoFileClip, AudioFileClip, concatenate_videoclips, vfx
 from dotenv import load_dotenv
 
 load_dotenv()
 SARVAM_API_KEY = os.getenv("SARVAM_API_KEY")
 
+# --- CUSTOM LOGGER FOR TELEGRAM ---
+class TelegramLogger(ProgressBarLogger):
+    def __init__(self, shared_state, batch_index, total_batches):
+        super().__init__()
+        self.shared_state = shared_state
+        self.batch_info = f"Batch {batch_index}/{total_batches}"
+
+    def callback(self, **changes):
+        # Every time a bar updates, this is called
+        for (parameter, value) in changes.items():
+            if parameter == 'bars':
+                # 't' is the main progress bar for rendering
+                if 't' in value:
+                    total = value['t']['total']
+                    index = value['t']['index']
+                    
+                    if total > 0:
+                        percent = int((index / total) * 100)
+                        # Update the shared dictionary
+                        self.shared_state['text'] = f"🎞️ **Rendering {self.batch_info}...**"
+                        self.shared_state['percent'] = percent
+                        self.shared_state['current'] = index
+                        self.shared_state['total'] = total
+
+# --- UTILS ---
 def make_progress_bar(current, total):
-    percentage = current * 100 / total
+    if total == 0: return "[░░░░░░░░░░] 0%"
+    percentage = min(current * 100 / total, 100)
     filled = int(percentage / 10)
     return f"[{'█' * filled}{'░' * (10 - filled)}] {int(percentage)}%"
 
@@ -45,32 +73,26 @@ def load_and_heal_json(file_path):
     with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
     try: return json.loads(content)
     except:
-        # Step 1: Remove invalid control characters
         content = re.sub(r'[\x00-\x1f\x7f]', ' ', content)
-        
-        # Step 2: Fix unescaped quotes (Using + instead of f-string to avoid SyntaxError)
         content = re.sub(
             r'("explanation_text"\s*:\s*")(.*?)("\s*[,}])', 
             lambda m: m.group(1) + m.group(2).replace('"', '\\"') + m.group(3), 
-            content, 
-            flags=re.DOTALL
+            content, flags=re.DOTALL
         )
-        
         try: return json.loads(content)
         except: raise ValueError("❌ Critical JSON Error: Could not auto-fix file.")
 
-def render_batch(video_path, segments, batch_index, temp_dir):
+# --- BATCH RENDERER ---
+def render_batch(video_path, segments, batch_index, total_batches, temp_dir, shared_state):
     """
-    Renders a batch and returns the filename.
+    Renders a batch and updates shared_state for the UI.
     """
     processed_clips = []
     original_video = VideoFileClip(video_path)
     
     try:
         for i, seg in enumerate(segments):
-            # Unique ID for temp audio to avoid conflicts
             audio_path = f"{temp_dir}/audio_{seg.get('id', f'b{batch_index}_{i}')}.wav"
-            
             if not os.path.exists(audio_path): continue
             
             try:
@@ -78,12 +100,10 @@ def render_batch(video_path, segments, batch_index, temp_dir):
                 start_t = parse_time(seg.get('start_time', '0:00'))
                 end_t = parse_time(seg.get('end_time', '0:00'))
                 
-                if start_t >= end_t: 
-                    audio_clip.close(); continue
+                if start_t >= end_t: audio_clip.close(); continue
 
                 video_chunk = original_video.subclipped(start_t, end_t)
-                
-                if video_chunk.duration < 0.1:
+                if video_chunk.duration < 0.1: 
                     video_chunk.close(); audio_clip.close(); continue
 
                 ratio = audio_clip.duration / video_chunk.duration
@@ -101,7 +121,6 @@ def render_batch(video_path, segments, batch_index, temp_dir):
 
                 final_chunk = final_chunk.with_audio(audio_clip)
                 processed_clips.append(final_chunk)
-                
             except Exception as e:
                 print(f"Clip Error: {e}")
 
@@ -111,10 +130,18 @@ def render_batch(video_path, segments, batch_index, temp_dir):
 
         batch_output = os.path.abspath(f"{temp_dir}/batch_{batch_index}.mp4")
         
-        # Important: We must use the same settings as final output would expect
+        # Attach our custom logger here
+        tg_logger = TelegramLogger(shared_state, batch_index, total_batches)
+
         final_video = concatenate_videoclips(processed_clips, method="compose")
         final_video.write_videofile(
-            batch_output, codec="libx264", audio_codec="aac", fps=24, preset='ultrafast', threads=4, logger=None
+            batch_output, 
+            codec="libx264", 
+            audio_codec="aac", 
+            fps=24, 
+            preset='ultrafast', 
+            threads=4, 
+            logger=tg_logger  # <--- THIS IS THE MAGIC
         )
         
         final_video.close()
@@ -129,6 +156,7 @@ def render_batch(video_path, segments, batch_index, temp_dir):
         original_video.close()
         return None
 
+# --- MAIN TASK ---
 async def process_video_task(video_path, map_path, output_path, status_callback):
     await status_callback("📂 **Loading Resources...**")
     
@@ -137,61 +165,77 @@ async def process_video_task(video_path, map_path, output_path, status_callback)
     
     temp_dir = "temp_audio"
     os.makedirs(temp_dir, exist_ok=True)
-    
     total = len(segments)
     
-    # --- PHASE 1: AUDIO GENERATION ---
+    # 1. AUDIO GENERATION
     for i, seg in enumerate(segments):
         if i % 5 == 0:
             await status_callback(f"🎙️ **Generating Audio...**\n{make_progress_bar(i, total)}")
-        
         audio_path = f"{temp_dir}/audio_{seg.get('id', i)}.wav"
         if not os.path.exists(audio_path):
             await asyncio.to_thread(generate_audio_sync, seg.get('explanation_text', ''), audio_path)
 
-    # --- PHASE 2: BATCH VIDEO RENDERING ---
-    await status_callback(f"🎞️ **Rendering Batches...**\n(Splitting work to save memory)")
-    
+    # 2. BATCH VIDEO RENDERING
     BATCH_SIZE = 10
-    batch_files = []
     total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
-    
-    for i in range(0, total, BATCH_SIZE):
-        batch_segments = segments[i : i + BATCH_SIZE]
-        batch_idx = i // BATCH_SIZE + 1
-        
-        await status_callback(f"🎞️ **Rendering Batch {batch_idx}/{total_batches}...**")
-        batch_file = await asyncio.to_thread(render_batch, video_path, batch_segments, batch_idx, temp_dir)
-        
-        if batch_file: batch_files.append(batch_file)
+    batch_files = []
 
-    if not batch_files:
-        raise Exception("No video segments were generated.")
+    # Shared State for Progress Bar
+    shared_state = {'text': 'Starting Render...', 'percent': 0, 'current': 0, 'total': 0}
+    render_running = True
 
-    # --- PHASE 3: INSTANT MERGE (FFMPEG) ---
-    await status_callback("🚀 **Instant Stitching...** (Final Step)")
-    
-    # Create FFmpeg List File
+    # Background Monitor Function
+    async def progress_monitor():
+        last_text = ""
+        while render_running:
+            await asyncio.sleep(4) # Update every 4 seconds
+            if shared_state['total'] > 0:
+                percent = shared_state['percent']
+                bar = make_progress_bar(shared_state['current'], shared_state['total'])
+                new_text = f"{shared_state['text']}\n{bar}"
+                
+                # Only edit if text changed substantially
+                if new_text != last_text:
+                    await status_callback(new_text)
+                    last_text = new_text
+
+    # Start the monitor
+    monitor_task = asyncio.create_task(progress_monitor())
+
+    try:
+        for i in range(0, total, BATCH_SIZE):
+            batch_segments = segments[i : i + BATCH_SIZE]
+            batch_idx = i // BATCH_SIZE + 1
+            
+            # Run rendering (updates shared_state internally)
+            batch_file = await asyncio.to_thread(
+                render_batch, 
+                video_path, 
+                batch_segments, 
+                batch_idx, 
+                total_batches, 
+                temp_dir, 
+                shared_state
+            )
+            
+            if batch_file: batch_files.append(batch_file)
+    finally:
+        render_running = False
+        monitor_task.cancel() # Stop the monitor
+
+    if not batch_files: raise Exception("No video segments generated.")
+
+    # 3. INSTANT MERGE
+    await status_callback("🚀 **Final Stitching...**")
     list_file_path = f"{temp_dir}/inputs.txt"
     with open(list_file_path, "w") as f:
-        for path in batch_files:
-            # Escape paths for FFmpeg
-            f.write(f"file '{path}'\n")
+        for path in batch_files: f.write(f"file '{path}'\n")
 
-    # Run FFmpeg Command (Copy Stream = Zero Re-encoding)
-    command = [
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0", 
-        "-i", list_file_path, 
-        "-c", "copy", 
-        output_path
-    ]
-    
-    process = await asyncio.create_subprocess_exec(
-        *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
+    command = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file_path, "-c", "copy", output_path]
+    process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     await process.communicate()
 
-    # Cleanup Batches
+    # Cleanup
     for f in batch_files:
         if os.path.exists(f): os.remove(f)
     if os.path.exists(list_file_path): os.remove(list_file_path)
