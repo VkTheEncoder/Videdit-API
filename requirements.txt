@@ -1,0 +1,7 @@
+pyrogram
+tgcrypto
+moviepy>=2.0.0.dev2
+requests
+python-dotenv
+aiohttp
+aiofiles
