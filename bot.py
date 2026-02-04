@@ -38,29 +38,59 @@ STATE_WAIT_NAME = 3
 STATE_QUEUED = 4
 
 # --- HELPER: Aria2 Downloader ---
+# Add this helper function ABOVE download_from_link
+async def download_fallback_slow(url, dest_path, status_msg, shared_state):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    print(f"❌ Fallback Download Failed: HTTP {response.status}")
+                    return False
+                
+                total = int(response.headers.get('content-length', 0))
+                downloaded = 0
+                start = time.time()
+                
+                async with aiofiles.open(dest_path, mode='wb') as f:
+                    async for chunk in response.content.iter_chunked(1024 * 1024):
+                        if shared_state.get('stop_signal', False): return False
+                        await f.write(chunk)
+                        downloaded += len(chunk)
+                        
+                        # Update progress bar
+                        if total > 0 and int(time.time()) % 4 == 0:
+                            await progress_bar(downloaded, total, "⬇️ **Downloading (Slow Mode)...**", start, status_msg)
+        return True
+    except Exception as e:
+        print(f"Fallback Error: {e}")
+        return False
+
+# Replace your existing download_from_link with this:
 async def download_from_link(url, dest_path, status_msg, shared_state):
     """
-    Downloads using local Aria2c binary (16 connections).
+    Tries High-Speed Aria2 first. If it fails, falls back to standard Python download.
     """
+    # 1. SETUP
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    if os.path.exists(dest_path): os.remove(dest_path)
+
+    # Locate Aria2
+    aria2_path = os.path.abspath("aria2c")
+    if not os.path.exists(aria2_path): aria2_path = "aria2c"
+
+    # 2. TRY ARIA2 (FAST)
+    print(f"🚀 Trying Aria2 download for: {url}")
+    command = [
+        aria2_path, url,
+        "-o", os.path.basename(dest_path),
+        "-d", os.path.dirname(dest_path),
+        "-x", "16", "-s", "16", "-k", "1M",
+        "--user-agent", "Mozilla/5.0",
+        "--check-certificate=false", # Fix SSL errors
+        "--summary-interval", "1"
+    ]
+
     try:
-        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-        if os.path.exists(dest_path): os.remove(dest_path)
-
-        # Get absolute path of local aria2c
-        aria2_path = os.path.abspath("aria2c")
-        if not os.path.exists(aria2_path):
-            print(f"⚠️ Local aria2c not found at {aria2_path}. Trying system 'aria2c'...")
-            aria2_path = "aria2c" 
-
-        command = [
-            aria2_path, url,
-            "-o", os.path.basename(dest_path),
-            "-d", os.path.dirname(dest_path),
-            "-x", "16", "-s", "16", "-k", "1M",
-            "--user-agent", "Mozilla/5.0",
-            "--summary-interval", "1"
-        ]
-
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
@@ -72,7 +102,6 @@ async def download_from_link(url, dest_path, status_msg, shared_state):
         last_update_time = 0
 
         while True:
-            # Check Stop Signal
             if shared_state.get('stop_signal', False):
                 try: process.kill()
                 except: pass
@@ -83,38 +112,40 @@ async def download_from_link(url, dest_path, status_msg, shared_state):
             
             decoded_line = line.decode().strip()
             
+            # Update Progress
             match = progress_pattern.search(decoded_line)
             if match:
                 percent = int(match.group(1))
                 now = time.time()
-                
-                # Update every 4s
                 if now - last_update_time > 4:
                     last_update_time = now
                     filled = int(percent / 10)
                     bar = f"[{'█' * filled}{'░' * (10 - filled)}] {percent}%"
                     elapsed = int(now - start_time)
-                    
                     try:
                         await status_msg.edit(
-                            f"⬇️ **Downloading (High Speed)...**\n"
-                            f"{bar}\n"
-                            f"**Time Elapsed:** {elapsed}s"
+                            f"🚀 **Downloading (High Speed)...**\n{bar}\n**Time:** {elapsed}s"
                         )
-                    except: pass 
+                    except: pass
 
         await process.wait()
         
+        # 3. CHECK SUCCESS
         if process.returncode == 0 and os.path.exists(dest_path):
             return True
         else:
-            print(f"Aria2 Failed. Return Code: {process.returncode}")
-            return False
+            # Capture the error message
+            stderr_data = await process.stderr.read()
+            print(f"⚠️ Aria2 Failed (Code {process.returncode}). Error: {stderr_data.decode().strip()}")
+            
+            # 4. ACTIVATE FALLBACK (SLOW)
+            await status_msg.edit(f"⚠️ **High Speed failed. Switching to Standard Download...**")
+            return await download_fallback_slow(url, dest_path, status_msg, shared_state)
 
     except Exception as e:
-        print(f"Aria2 Error: {e}")
-        return False
-
+        print(f"Aria2 Exception: {e}")
+        return await download_fallback_slow(url, dest_path, status_msg, shared_state)
+        
 async def clean_up(paths):
     for p in paths:
         if p and os.path.exists(p):
