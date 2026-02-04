@@ -123,6 +123,13 @@ async def queue_worker():
             task_queue.task_done()
             user_sessions.pop(user_id, None)
 
+Here is the complete, corrected code block for download_from_link.
+
+You should replace the entire existing download_from_link function in your bot.py with this code.
+
+Prerequisite: Ensure you have added import re at the very top of your bot.py file along with the other imports.
+
+Python
 async def download_from_link(url, dest_path, status_msg, shared_state):
     """
     Downloads using local Aria2c binary (16 connections).
@@ -133,9 +140,19 @@ async def download_from_link(url, dest_path, status_msg, shared_state):
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         if os.path.exists(dest_path): os.remove(dest_path)
 
+        # Get the absolute path of aria2c in the current folder
+        # This fixes the "No such file or directory" error
+        aria2_path = os.path.abspath("aria2c")
+
+        # Check if it exists before running
+        if not os.path.exists(aria2_path):
+            print(f"❌ Error: aria2c binary not found at {aria2_path}")
+            # Fallback: Try system aria2c if local is missing
+            aria2_path = "aria2c" 
+
         # Command to run local ./aria2c
         command = [
-            "./aria2c", url,
+            aria2_path, url,
             "-o", os.path.basename(dest_path),
             "-d", os.path.dirname(dest_path),
             "-x", "16", "-s", "16", "-k", "1M",
@@ -156,7 +173,7 @@ async def download_from_link(url, dest_path, status_msg, shared_state):
         last_update_time = 0
 
         while True:
-            # Check for STOP command
+            # Check for STOP command from /stopall
             if shared_state.get('stop_signal', False):
                 try: process.kill()
                 except: pass
