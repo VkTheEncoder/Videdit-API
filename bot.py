@@ -3,6 +3,7 @@ import time
 import asyncio
 import aiohttp
 import aiofiles
+import re
 from pyrogram import Client, filters
 from dotenv import load_dotenv
 from processor import process_video_task
@@ -123,21 +124,84 @@ async def queue_worker():
             user_sessions.pop(user_id, None)
 
 async def download_from_link(url, dest_path, status_msg, shared_state):
+    """
+    Downloads using local Aria2c binary (16 connections).
+    Updates the Telegram status message with real-time progress.
+    """
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if response.status != 200: return False
-                total = int(response.headers.get('content-length', 0))
-                downloaded = 0
-                start = time.time()
-                async with aiofiles.open(dest_path, mode='wb') as f:
-                    async for chunk in response.content.iter_chunked(1024 * 1024):
-                        if shared_state['stop_signal']: return False
-                        await f.write(chunk)
-                        downloaded += len(chunk)
-                        if total > 0: await progress_bar(downloaded, total, "⬇️ **Downloading...**", start, status_msg)
-        return True
-    except: return False
+        # Ensure directory exists & remove old file
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        if os.path.exists(dest_path): os.remove(dest_path)
+
+        # Command to run local ./aria2c
+        command = [
+            "./aria2c", url,
+            "-o", os.path.basename(dest_path),
+            "-d", os.path.dirname(dest_path),
+            "-x", "16", "-s", "16", "-k", "1M",
+            "--user-agent", "Mozilla/5.0",
+            "--summary-interval", "1"
+        ]
+
+        # Start the process
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        # Regex to find "(45%)" in the logs
+        progress_pattern = re.compile(r"\((\d+)%\)")
+        start_time = time.time()
+        last_update_time = 0
+
+        while True:
+            # Check for STOP command
+            if shared_state.get('stop_signal', False):
+                try: process.kill()
+                except: pass
+                return False
+
+            line = await process.stdout.readline()
+            if not line: break
+            
+            decoded_line = line.decode().strip()
+            
+            # Find percentage
+            match = progress_pattern.search(decoded_line)
+            if match:
+                percent = int(match.group(1))
+                
+                # Update UI every 4 seconds to avoid spamming Telegram
+                now = time.time()
+                if now - last_update_time > 4:
+                    last_update_time = now
+                    
+                    # Create a visual bar [████░░░░░░]
+                    filled = int(percent / 10)
+                    bar = f"[{'█' * filled}{'░' * (10 - filled)}] {percent}%"
+                    elapsed = int(now - start_time)
+                    
+                    try:
+                        await status_msg.edit(
+                            f"⬇️ **Downloading (High Speed)...**\n"
+                            f"{bar}\n"
+                            f"**Time Elapsed:** {elapsed}s"
+                        )
+                    except: pass # Ignore edit errors
+
+        await process.wait()
+        
+        # Check if file exists and download finished successfully
+        if process.returncode == 0 and os.path.exists(dest_path):
+            return True
+        else:
+            print(f"Aria2 Failed. Return Code: {process.returncode}")
+            return False
+
+    except Exception as e:
+        print(f"Aria2 Error: {e}")
+        return False
 
 async def clean_up(paths):
     for p in paths:
