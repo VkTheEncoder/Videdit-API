@@ -164,6 +164,7 @@ async def queue_worker():
         user_id = task_data['user_id']
         chat_id = task_data['chat_id']
         status_msg = task_data['status_msg']
+        task_id = task_data['task_id']
         
         shared_state = {'stop_signal': False, 'text': '', 'percent': 0, 'current': 0, 'total': 0}
         current_task_info = {'user_id': user_id, 'shared_state': shared_state, 'status_msg': status_msg}
@@ -202,7 +203,8 @@ async def queue_worker():
                 task_data['json_path'], 
                 output_video_path, 
                 update_status_text,
-                shared_state
+                shared_state,
+                task_id
             )
 
             # 3. Upload
@@ -280,12 +282,14 @@ async def handle_doc(client, message):
         # FIX: Add timestamp to make filename UNIQUE for every single task
         # This prevents "Episode 2" from overwriting "Episode 1"
         timestamp = int(time.time())
+        task_id = f"{uid}_{timestamp}"
         unique_filename = f"{uid}_{timestamp}_map.json"
         path = os.path.join(DOWNLOAD_DIR, unique_filename)
         
         await message.download(file_name=path)
         
         sess["data"]["json_path"] = path
+        sess["data"]["task_id"] = task_id
         sess["state"] = STATE_WAIT_VIDEO
         await status.edit("✅ **Map Saved!**\nStep 2: Send Video or Link.")
 
