@@ -38,6 +38,65 @@ def make_progress_bar(current, total):
     filled = int(percentage / 10)
     return f"[{'█' * filled}{'░' * (10 - filled)}] {int(percentage)}%"
 
+def time_formatter(seconds):
+    return time.strftime("%H:%M:%S", time.gmtime(seconds))
+
+async def run_ffmpeg_with_progress(command, total_duration, status_callback):
+    """
+    Runs FFmpeg and parses stderr to show Size, Speed, ETA.
+    """
+    process = await asyncio.create_subprocess_exec(
+        *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    
+    # Regex to extract: time=00:01:23.45 bitrate=1234kbits/s speed=1.5x
+    pattern = re.compile(r"time=(\d{2}:\d{2}:\d{2}\.\d+).*?speed=\s*(\d+\.?\d*)x")
+    
+    start_time = time.time()
+    last_update = 0
+
+    while True:
+        # Read line by line from stderr (where ffmpeg prints logs)
+        line_bytes = await process.stderr.readline()
+        if not line_bytes: break
+        
+        line = line_bytes.decode('utf-8', errors='ignore').strip()
+        
+        match = pattern.search(line)
+        if match:
+            current_time_str = match.group(1)
+            speed_str = match.group(2)
+            
+            try:
+                # Convert "00:01:23.45" to seconds
+                curr_seconds = parse_time(current_time_str)
+                speed = float(speed_str)
+                
+                if total_duration > 0 and speed > 0:
+                    percent = min((curr_seconds / total_duration) * 100, 99)
+                    
+                    # Calculate ETA
+                    remaining_seconds = total_duration - curr_seconds
+                    eta = remaining_seconds / speed
+                    
+                    # Update Telegram every 4 seconds
+                    now = time.time()
+                    if now - last_update > 4:
+                        last_update = now
+                        
+                        bar = make_progress_bar(percent, 100)
+                        status_text = (
+                            f"🚀 **Final Compression (x265)**\n"
+                            f"{bar} **{int(percent)}%**\n\n"
+                            f"⚡ **Speed:** {speed}x\n"
+                            f"⏳ **ETA:** {time_formatter(eta)}\n"
+                            f"🕒 **Time:** {time_formatter(curr_seconds)}"
+                        )
+                        await status_callback(status_text)
+            except: pass
+
+    await process.wait()
+
 def parse_time(time_str):
     try:
         parts = time_str.split(':')
@@ -204,17 +263,16 @@ async def process_video_task(video_path, map_path, output_path, status_callback,
         with open(list_file_path, "w") as f:
             for path in batch_files: f.write(f"file '{path}'\n")
 
-        # Get total duration for progress calculation
+        # Get Total Duration (Correctly)
+        total_duration = 0
         try:
-            probe = await asyncio.create_subprocess_exec(
-                "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", list_file_path,
-                stdout=asyncio.subprocess.PIPE
-            )
-            # Duration approximation logic omitted for simplicity, using basic duration
-            total_duration = 0 # Difficult to get exact duration of concat list easily without rendering
-            # Fallback: Assume total duration is roughly sum of clips. 
-            # For progress bar, we just show "Encoding..." since exact duration is hard to parse from concat list efficiently.
-        except: pass
+            # Probe the concatenation file to get total length
+            cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", "-f", "concat", "-safe", "0", list_file_path]
+            process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, _ = await process.communicate()
+            total_duration = float(stdout.decode().strip())
+        except: 
+            total_duration = 1800 # Fallback: 30 mins dummy default
 
         command = [
             "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file_path,
@@ -222,8 +280,8 @@ async def process_video_task(video_path, map_path, output_path, status_callback,
             "-c:a", "aac", "-b:a", "128k", "-tag:v", "hvc1", output_path
         ]
         
-        process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        await process.communicate()
+        # Run with Custom Progress Parser
+        await run_ffmpeg_with_progress(command, total_duration, status_callback)
 
     finally:
         # --- FIX: DELETE TEMP DIR ---
