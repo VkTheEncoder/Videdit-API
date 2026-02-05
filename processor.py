@@ -192,13 +192,10 @@ async def process_video_task(video_path, map_path, output_path, status_callback,
         while render_running:
             if shared_state.get('stop_signal', False): break 
             
-            await asyncio.sleep(3) # Update every 3s
-            
-            # Construct Status Message
+            await asyncio.sleep(3)
             percent = shared_state.get('percent', 0)
             text_header = shared_state.get('text', "⏳ Starting Render...")
-            
-            bar = make_progress_bar(percent, 100) # Use percent directly
+            bar = make_progress_bar(percent, 100)
             new_text = f"{text_header}\n{bar}"
             
             if new_text != last_text:
@@ -216,7 +213,6 @@ async def process_video_task(video_path, map_path, output_path, status_callback,
             batch_segments = segments[i : i + BATCH_SIZE]
             batch_idx = i // BATCH_SIZE + 1
             
-            # Pass shared_state to the thread
             batch_file = await asyncio.to_thread(
                 render_batch, 
                 video_path, 
@@ -236,16 +232,35 @@ async def process_video_task(video_path, map_path, output_path, status_callback,
 
     if not batch_files: raise Exception("No video segments generated.")
 
-    # 3. MERGE
-    await status_callback("🚀 **Final Stitching...**")
+    # 3. FINAL MERGE & COMPRESSION (RE-ENCODE)
+    await status_callback("🚀 **Final Compression (x265)...**\n(Reducing size, please wait...)")
+    
+    # Create input list for FFmpeg
     list_file_path = f"{temp_dir}/inputs.txt"
     with open(list_file_path, "w") as f:
         for path in batch_files: f.write(f"file '{path}'\n")
 
-    command = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file_path, "-c", "copy", output_path]
+    # FFmpeg Command: Concatenate AND Re-encode to HEVC (x265)
+    # This reduces size drastically while keeping quality.
+    command = [
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", list_file_path,
+        "-c:v", "libx265",       # High Efficiency Codec
+        "-crf", "25",            # Quality Balance (Lower = Better Quality/Bigger Size)
+        "-preset", "veryfast",   # Encoding Speed
+        "-c:a", "aac",           # Audio Codec (Safe choice)
+        "-b:a", "128k",
+        "-tag:v", "hvc1",        # Apple/Telegram compatibility tag
+        output_path
+    ]
+    
+    # Run compression
     process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     await process.communicate()
 
+    # Cleanup
     for f in batch_files:
         if os.path.exists(f): os.remove(f)
     if os.path.exists(list_file_path): os.remove(list_file_path)
