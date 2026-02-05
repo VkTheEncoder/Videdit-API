@@ -276,7 +276,13 @@ async def handle_doc(client, message):
             return
         
         status = await message.reply_text("📥 Saving Map...")
-        path = os.path.join(DOWNLOAD_DIR, f"{uid}_map.json")
+        
+        # FIX: Add timestamp to make filename UNIQUE for every single task
+        # This prevents "Episode 2" from overwriting "Episode 1"
+        timestamp = int(time.time())
+        unique_filename = f"{uid}_{timestamp}_map.json"
+        path = os.path.join(DOWNLOAD_DIR, unique_filename)
+        
         await message.download(file_name=path)
         
         sess["data"]["json_path"] = path
