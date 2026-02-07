@@ -108,17 +108,39 @@ def parse_time(time_str):
 def generate_audio_sync(text, filename):
     if not text or not text.strip(): return False
     try:
+        # 1. Print that we are starting
+        print(f"🎙️ Requesting Audio for: {filename}...")
+
         response = requests.post(
             "https://api.sarvam.ai/text-to-speech",
             json={"text": text, "target_language_code": "hi-IN", "speaker": "shubh", "model": "bulbul:v3-beta"},
             headers={"api-subscription-key": SARVAM_API_KEY}
         )
+        
+        # 2. Check for success
         if response.status_code == 200:
-            with open(filename, "wb") as f:
-                f.write(base64.b64decode(response.json()["audios"][0]))
-            return True
-    except: pass
+            data = response.json()
+            if "audios" in data and len(data["audios"]) > 0:
+                decoded_audio = base64.b64decode(data["audios"][0])
+                
+                # Only open the file if we have data
+                with open(filename, "wb") as f:
+                    f.write(decoded_audio)
+                print(f"✅ Audio Saved: {filename}")
+                return True
+            else:
+                print(f"❌ API returned 200 but no audio data: {data}")
+        else:
+            print(f"❌ API Error {response.status_code}: {response.text}")
+
+    except Exception as e:
+        print(f"❌ Exception in Audio Gen: {e}")
+        # Clean up if a partial file was created
+        if os.path.exists(filename):
+            os.remove(filename)
+            
     return False
+
 
 def load_and_heal_json(file_path):
     with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
