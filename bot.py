@@ -3,6 +3,7 @@ import time
 import asyncio
 import aiohttp
 import aiofiles
+import urllib.request
 import re  # Added for Aria2 regex
 from pyrogram import Client, filters
 from dotenv import load_dotenv
