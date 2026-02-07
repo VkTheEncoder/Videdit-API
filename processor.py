@@ -247,7 +247,7 @@ async def process_video_task(video_path, map_path, output_path, status_callback,
                 await asyncio.to_thread(generate_audio_sync, seg.get('explanation_text', ''), audio_path)
 
         # 2. BATCHES
-        BATCH_SIZE = 4
+        BATCH_SIZE = 10
         total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
         batch_files = []
         render_running = True
