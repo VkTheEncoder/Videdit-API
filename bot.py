@@ -207,19 +207,34 @@ async def queue_worker():
                 task_id
             )
 
-            # 3. Upload
-            await status_msg.edit("⬆️ **Uploading Final Video...**")
-            await app.send_video(
+            # 3. Generate Thumbnail & Upload
+            thumb_path = os.path.join(OUTPUT_DIR, f"{task_data['filename']}.jpg")
+            
+            # Generate thumbnail using FFmpeg (takes a snapshot at 1 second)
+            try:
+                thumb_proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-i", output_video_path, "-ss", "00:00:05", "-vframes", "1", thumb_path, "-y",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                await thumb_proc.wait()
+            except Exception as e:
+                print(f"Thumbnail generation failed: {e}")
+
+            await status_msg.edit("⬆️ **Uploading as Document...**")
+            
+            # Send as Document with Thumbnail
+            await app.send_document(
                 chat_id=chat_id,
-                video=output_video_path,
+                document=output_video_path,
+                thumb=thumb_path if os.path.exists(thumb_path) else None,
                 caption=f"✅ **{task_data['filename']}** is ready!",
                 progress=progress_bar,
                 progress_args=("⬆️ **Uploading...**", time.time(), status_msg)
             )
             await status_msg.delete()
             
-            # Cleanup
-            await clean_up([task_data['json_path'], input_video_path, output_video_path])
+            # Cleanup (Added thumb_path to cleanup list)
+            await clean_up([task_data['json_path'], input_video_path, output_video_path, thumb_path])
 
         except Exception as e:
             msg = str(e)
