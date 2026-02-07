@@ -195,7 +195,10 @@ def render_batch(video_path, segments, batch_index, total_batches, temp_dir, sha
 
                 final_chunk = final_chunk.with_audio(audio_clip)
                 processed_clips.append(final_chunk)
-            except: pass
+
+            except Exception as e:  # ⬅️ NEW: Catch the specific error
+                print(f"❌ Batch Render Error (Seg {i}): {e}") # ⬅️ NEW: Print it to logs
+                pass
 
         if not processed_clips:
             original_video.close()
