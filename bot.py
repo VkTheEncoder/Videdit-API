@@ -359,27 +359,31 @@ async def handle_doc(client, message):
         sess["state"] = STATE_WAIT_VIDEO
         await status.edit("✅ **Map Saved!**\nStep 2: Send Video or Link.")
 
-@app.on_message(filters.video | filters.text)
+@app.on_message(filters.video | filters.document | filters.text)
 async def handle_input(client, message):
     uid = message.from_user.id
     sess = user_sessions.get(uid)
     if not sess: return
 
     if sess["state"] == STATE_WAIT_VIDEO:
-        if message.video:
+        # Check for Video OR Document (Video File)
+        if message.video or (message.document and message.document.mime_type and message.document.mime_type.startswith("video/")):
             sess["data"]["video_source"] = "telegram"
             sess["data"]["video_message"] = message
             sess["state"] = STATE_WAIT_NAME
             await message.reply_text("✅ Video Received!\nStep 3: Send Output Name.")
+        
         elif message.text and message.text.startswith("http"):
             sess["data"]["video_source"] = "link"
             sess["data"]["video_link"] = message.text
             sess["state"] = STATE_WAIT_NAME
             await message.reply_text("✅ Link Received!\nStep 3: Send Output Name.")
+        
         else:
-            await message.reply_text("❌ Invalid. Send Video or Link.")
+            await message.reply_text("❌ Invalid. Send a Video file or a Link.")
 
     elif sess["state"] == STATE_WAIT_NAME:
+        # (This part stays exactly the same as before)
         name = message.text.strip().replace(" ", "_")
         sess["data"]["filename"] = name
         sess["data"]["user_id"] = uid
