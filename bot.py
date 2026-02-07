@@ -332,48 +332,48 @@ async def start(client, message):
     user_sessions[message.from_user.id] = {"state": STATE_WAIT_JSON, "data": {}}
     await message.reply_text("👋 **Welcome!**\nStep 1: Send `map.json` file.")
 
-@app.on_message(filters.document)
-async def handle_doc(client, message):
-    uid = message.from_user.id
-    sess = user_sessions.get(uid)
-    if not sess: return
-
-    if sess["state"] == STATE_WAIT_JSON:
-        if not message.document.file_name.endswith(".json"):
-            await message.reply_text("❌ Send a valid .json file.")
-            return
-        
-        status = await message.reply_text("📥 Saving Map...")
-        
-        # FIX: Add timestamp to make filename UNIQUE for every single task
-        # This prevents "Episode 2" from overwriting "Episode 1"
-        timestamp = int(time.time())
-        task_id = f"{uid}_{timestamp}"
-        unique_filename = f"{uid}_{timestamp}_map.json"
-        path = os.path.join(DOWNLOAD_DIR, unique_filename)
-        
-        await message.download(file_name=path)
-        
-        sess["data"]["json_path"] = path
-        sess["data"]["task_id"] = task_id
-        sess["state"] = STATE_WAIT_VIDEO
-        await status.edit("✅ **Map Saved!**\nStep 2: Send Video or Link.")
-
 @app.on_message(filters.video | filters.document | filters.text)
-async def handle_input(client, message):
+async def main_router(client, message):
+    # 0. Ignore commands (let the other handlers take them)
+    if message.text and message.text.startswith("/"): return
+
+    # 1. Check User Session
     uid = message.from_user.id
     sess = user_sessions.get(uid)
     if not sess: return
 
-    if sess["state"] == STATE_WAIT_VIDEO:
-        # Check for Video OR Document (Video File)
-        if message.video or (message.document and message.document.mime_type and message.document.mime_type.startswith("video/")):
+    # --- STATE 1: WAITING FOR MAP (JSON) ---
+    if sess["state"] == STATE_WAIT_JSON:
+        if message.document and message.document.file_name.endswith(".json"):
+            status = await message.reply_text("📥 Saving Map...")
+            
+            # Generate unique ID
+            timestamp = int(time.time())
+            task_id = f"{uid}_{timestamp}"
+            unique_filename = f"{uid}_{timestamp}_map.json"
+            path = os.path.join(DOWNLOAD_DIR, unique_filename)
+            
+            await message.download(file_name=path)
+            
+            sess["data"]["json_path"] = path
+            sess["data"]["task_id"] = task_id
+            sess["state"] = STATE_WAIT_VIDEO
+            await status.edit("✅ **Map Saved!**\nStep 2: Send Video or Link.")
+        else:
+            await message.reply_text("❌ Please send a valid .json file.")
+
+    # --- STATE 2: WAITING FOR VIDEO (File, Stream, or Link) ---
+    elif sess["state"] == STATE_WAIT_VIDEO:
+        # Check if it is a video (Stream) OR a Document with video mime type
+        is_video_file = message.video or (message.document and message.document.mime_type and "video" in message.document.mime_type)
+        
+        if is_video_file:
             sess["data"]["video_source"] = "telegram"
             sess["data"]["video_message"] = message
             sess["state"] = STATE_WAIT_NAME
             await message.reply_text("✅ Video Received!\nStep 3: Send Output Name.")
         
-        elif message.text and message.text.startswith("http"):
+        elif message.text and "http" in message.text:
             sess["data"]["video_source"] = "link"
             sess["data"]["video_link"] = message.text
             sess["state"] = STATE_WAIT_NAME
@@ -382,8 +382,12 @@ async def handle_input(client, message):
         else:
             await message.reply_text("❌ Invalid. Send a Video file or a Link.")
 
+    # --- STATE 3: WAITING FOR NAME ---
     elif sess["state"] == STATE_WAIT_NAME:
-        # (This part stays exactly the same as before)
+        if not message.text: 
+            await message.reply_text("❌ Send a text name.")
+            return
+
         name = message.text.strip().replace(" ", "_")
         sess["data"]["filename"] = name
         sess["data"]["user_id"] = uid
