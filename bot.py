@@ -3,7 +3,10 @@ import time
 import asyncio
 import aiohttp
 import aiofiles
-import urllib.request
+import shutil          # Needed for auto-install
+import tarfile         # Needed for auto-install (This was missing)
+import urllib.request  # Needed for auto-install
+import stat            # Needed for auto-install
 import re  # Added for Aria2 regex
 from pyrogram import Client, filters
 from dotenv import load_dotenv
