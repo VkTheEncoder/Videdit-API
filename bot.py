@@ -19,6 +19,53 @@ app = Client(
     workers=4
 )
 
+# --- ARIA2 AUTO-INSTALLER ---
+def install_aria2_if_missing():
+    aria_path = "aria2c"
+    if os.path.exists(aria_path):
+        print("✅ Aria2 is already installed.")
+        return
+
+    print("⬇️ Aria2 missing. Downloading static build...")
+    ARIA_URL = "https://github.com/asdo92/aria2-static-builds/releases/download/v1.37.0/aria2-1.37.0-linux-gnu-64bit-build1.tar.bz2"
+    TAR_FILENAME = "aria2_download.tar.bz2"
+    EXTRACT_FOLDER = "aria2_extracted"
+
+    try:
+        # Download
+        urllib.request.urlretrieve(ARIA_URL, TAR_FILENAME)
+        
+        # Extract
+        with tarfile.open(TAR_FILENAME, "r:bz2") as tar:
+            tar.extractall(EXTRACT_FOLDER)
+
+        # Find binary
+        binary_found = False
+        for root, dirs, files in os.walk(EXTRACT_FOLDER):
+            if "aria2c" in files:
+                binary_path = os.path.join(root, "aria2c")
+                shutil.move(binary_path, aria_path)
+                binary_found = True
+                break
+
+        if binary_found:
+            # Make executable (chmod +x)
+            st = os.stat(aria_path)
+            os.chmod(aria_path, st.st_mode | stat.S_IEXEC)
+            print("✅ Aria2 installed successfully!")
+        else:
+            print("❌ Failed to find aria2c binary in download.")
+
+    except Exception as e:
+        print(f"❌ Auto-install failed: {e}")
+    finally:
+        # Cleanup
+        if os.path.exists(TAR_FILENAME): os.remove(TAR_FILENAME)
+        if os.path.exists(EXTRACT_FOLDER): shutil.rmtree(EXTRACT_FOLDER, ignore_errors=True)
+
+# Run the check immediately
+install_aria2_if_missing()
+
 DOWNLOAD_DIR = "downloads"
 OUTPUT_DIR = "outputs"
 TEMP_AUDIO = "temp_audio"
