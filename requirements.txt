@@ -1,7 +1,7 @@
-pyrogram==2.0.106
+pyrogram
 tgcrypto
 moviepy>=2.0.0.dev2
 requests
 python-dotenv
-aiohttp==3.8.6
+aiohttp
 aiofiles
