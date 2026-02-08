@@ -3,10 +3,6 @@ import time
 import asyncio
 import aiohttp
 import aiofiles
-import shutil          # Needed for auto-install
-import tarfile         # Needed for auto-install (This was missing)
-import urllib.request  # Needed for auto-install
-import stat            # Needed for auto-install
 import re  # Added for Aria2 regex
 from pyrogram import Client, filters
 from dotenv import load_dotenv
@@ -22,53 +18,6 @@ app = Client(
     bot_token=os.getenv("BOT_TOKEN"),
     workers=4
 )
-
-# --- ARIA2 AUTO-INSTALLER ---
-def install_aria2_if_missing():
-    aria_path = "aria2c"
-    if os.path.exists(aria_path):
-        print("✅ Aria2 is already installed.")
-        return
-
-    print("⬇️ Aria2 missing. Downloading static build...")
-    ARIA_URL = "https://github.com/asdo92/aria2-static-builds/releases/download/v1.37.0/aria2-1.37.0-linux-gnu-64bit-build1.tar.bz2"
-    TAR_FILENAME = "aria2_download.tar.bz2"
-    EXTRACT_FOLDER = "aria2_extracted"
-
-    try:
-        # Download
-        urllib.request.urlretrieve(ARIA_URL, TAR_FILENAME)
-        
-        # Extract
-        with tarfile.open(TAR_FILENAME, "r:bz2") as tar:
-            tar.extractall(EXTRACT_FOLDER)
-
-        # Find binary
-        binary_found = False
-        for root, dirs, files in os.walk(EXTRACT_FOLDER):
-            if "aria2c" in files:
-                binary_path = os.path.join(root, "aria2c")
-                shutil.move(binary_path, aria_path)
-                binary_found = True
-                break
-
-        if binary_found:
-            # Make executable (chmod +x)
-            st = os.stat(aria_path)
-            os.chmod(aria_path, st.st_mode | stat.S_IEXEC)
-            print("✅ Aria2 installed successfully!")
-        else:
-            print("❌ Failed to find aria2c binary in download.")
-
-    except Exception as e:
-        print(f"❌ Auto-install failed: {e}")
-    finally:
-        # Cleanup
-        if os.path.exists(TAR_FILENAME): os.remove(TAR_FILENAME)
-        if os.path.exists(EXTRACT_FOLDER): shutil.rmtree(EXTRACT_FOLDER, ignore_errors=True)
-
-# Run the check immediately
-install_aria2_if_missing()
 
 DOWNLOAD_DIR = "downloads"
 OUTPUT_DIR = "outputs"
@@ -258,34 +207,19 @@ async def queue_worker():
                 task_id
             )
 
-            # 3. Generate Thumbnail & Upload
-            thumb_path = os.path.join(OUTPUT_DIR, f"{task_data['filename']}.jpg")
-            
-            # Generate thumbnail using FFmpeg (takes a snapshot at 1 second)
-            try:
-                thumb_proc = await asyncio.create_subprocess_exec(
-                    "ffmpeg", "-i", output_video_path, "-ss", "00:00:05", "-vframes", "1", thumb_path, "-y",
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-                )
-                await thumb_proc.wait()
-            except Exception as e:
-                print(f"Thumbnail generation failed: {e}")
-
-            await status_msg.edit("⬆️ **Uploading as Document...**")
-            
-            # Send as Document with Thumbnail
-            await app.send_document(
+            # 3. Upload
+            await status_msg.edit("⬆️ **Uploading Final Video...**")
+            await app.send_video(
                 chat_id=chat_id,
-                document=output_video_path,
-                thumb=thumb_path if os.path.exists(thumb_path) else None,
+                video=output_video_path,
                 caption=f"✅ **{task_data['filename']}** is ready!",
                 progress=progress_bar,
                 progress_args=("⬆️ **Uploading...**", time.time(), status_msg)
             )
             await status_msg.delete()
             
-            # Cleanup (Added thumb_path to cleanup list)
-            await clean_up([task_data['json_path'], input_video_path, output_video_path, thumb_path])
+            # Cleanup
+            await clean_up([task_data['json_path'], input_video_path, output_video_path])
 
         except Exception as e:
             msg = str(e)
@@ -332,62 +266,54 @@ async def start(client, message):
     user_sessions[message.from_user.id] = {"state": STATE_WAIT_JSON, "data": {}}
     await message.reply_text("👋 **Welcome!**\nStep 1: Send `map.json` file.")
 
-@app.on_message(filters.video | filters.document | filters.text)
-async def main_router(client, message):
-    # 0. Ignore commands (let the other handlers take them)
-    if message.text and message.text.startswith("/"): return
-
-    # 1. Check User Session
+@app.on_message(filters.document)
+async def handle_doc(client, message):
     uid = message.from_user.id
     sess = user_sessions.get(uid)
     if not sess: return
 
-    # --- STATE 1: WAITING FOR MAP (JSON) ---
     if sess["state"] == STATE_WAIT_JSON:
-        if message.document and message.document.file_name.endswith(".json"):
-            status = await message.reply_text("📥 Saving Map...")
-            
-            # Generate unique ID
-            timestamp = int(time.time())
-            task_id = f"{uid}_{timestamp}"
-            unique_filename = f"{uid}_{timestamp}_map.json"
-            path = os.path.join(DOWNLOAD_DIR, unique_filename)
-            
-            await message.download(file_name=path)
-            
-            sess["data"]["json_path"] = path
-            sess["data"]["task_id"] = task_id
-            sess["state"] = STATE_WAIT_VIDEO
-            await status.edit("✅ **Map Saved!**\nStep 2: Send Video or Link.")
-        else:
-            await message.reply_text("❌ Please send a valid .json file.")
-
-    # --- STATE 2: WAITING FOR VIDEO (File, Stream, or Link) ---
-    elif sess["state"] == STATE_WAIT_VIDEO:
-        # Check if it is a video (Stream) OR a Document with video mime type
-        is_video_file = message.video or (message.document and message.document.mime_type and "video" in message.document.mime_type)
+        if not message.document.file_name.endswith(".json"):
+            await message.reply_text("❌ Send a valid .json file.")
+            return
         
-        if is_video_file:
+        status = await message.reply_text("📥 Saving Map...")
+        
+        # FIX: Add timestamp to make filename UNIQUE for every single task
+        # This prevents "Episode 2" from overwriting "Episode 1"
+        timestamp = int(time.time())
+        task_id = f"{uid}_{timestamp}"
+        unique_filename = f"{uid}_{timestamp}_map.json"
+        path = os.path.join(DOWNLOAD_DIR, unique_filename)
+        
+        await message.download(file_name=path)
+        
+        sess["data"]["json_path"] = path
+        sess["data"]["task_id"] = task_id
+        sess["state"] = STATE_WAIT_VIDEO
+        await status.edit("✅ **Map Saved!**\nStep 2: Send Video or Link.")
+
+@app.on_message(filters.video | filters.text)
+async def handle_input(client, message):
+    uid = message.from_user.id
+    sess = user_sessions.get(uid)
+    if not sess: return
+
+    if sess["state"] == STATE_WAIT_VIDEO:
+        if message.video:
             sess["data"]["video_source"] = "telegram"
             sess["data"]["video_message"] = message
             sess["state"] = STATE_WAIT_NAME
             await message.reply_text("✅ Video Received!\nStep 3: Send Output Name.")
-        
-        elif message.text and "http" in message.text:
+        elif message.text and message.text.startswith("http"):
             sess["data"]["video_source"] = "link"
             sess["data"]["video_link"] = message.text
             sess["state"] = STATE_WAIT_NAME
             await message.reply_text("✅ Link Received!\nStep 3: Send Output Name.")
-        
         else:
-            await message.reply_text("❌ Invalid. Send a Video file or a Link.")
+            await message.reply_text("❌ Invalid. Send Video or Link.")
 
-    # --- STATE 3: WAITING FOR NAME ---
     elif sess["state"] == STATE_WAIT_NAME:
-        if not message.text: 
-            await message.reply_text("❌ Send a text name.")
-            return
-
         name = message.text.strip().replace(" ", "_")
         sess["data"]["filename"] = name
         sess["data"]["user_id"] = uid
