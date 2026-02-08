@@ -91,10 +91,12 @@ async def download_from_link(url, dest_path, status_msg, shared_state):
     ]
 
     try:
+        # FIX: Increased buffer limit to 5MB
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            limit=1024 * 1024 * 5  # 5MB Limit
         )
 
         progress_pattern = re.compile(r"\((\d+)%\)")
