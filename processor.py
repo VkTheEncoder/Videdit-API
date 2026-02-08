@@ -45,8 +45,12 @@ async def run_ffmpeg_with_progress(command, total_duration, status_callback):
     """
     Runs FFmpeg and parses stderr to show Size, Speed, ETA.
     """
+    # FIX: Increased buffer limit to 5MB to prevent "Separator not found" crash
     process = await asyncio.create_subprocess_exec(
-        *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        *command, 
+        stdout=asyncio.subprocess.PIPE, 
+        stderr=asyncio.subprocess.PIPE,
+        limit=1024 * 1024 * 5  # 5MB Limit (Fixes the crash)
     )
     
     # Regex to extract: time=00:01:23.45 bitrate=1234kbits/s speed=1.5x
